@@ -1,176 +1,180 @@
 // =============================================================================
 //
+//   Creative Pull (Meta)  —  EXACT AD LOOKUP BY ID
 //
+//   Reads Campaign ID (K), Ad Set ID (L), Ad ID (M) from the "Lead Data" sheet,
+//   finds the exact ad in the ad account, and writes back:
+//       Preview Link          → Column N
+//       Creative Preview Link → Column O
+//       Ad Thumbnail          → Column P
 //
-// Testing Creative Pulling  —  ID-BASED LOOKUP
-//   Looks up the creative in Ads Manager by Campaign ID, Ad Set ID, and Ad ID
-//   (instead of by Campaign / Ad Set / Ad NAME).
-//
-//
+//   Secrets (Ad Account ID, Access Token) and the daily trigger time are set
+//   once via setSecrets().
 //
 // =============================================================================
 
 /****************************************************
- * CONFIG — Adjust columns, schedule, sizing, pacing here
+ * 1) SET SECRETS + INSTALL DAILY TRIGGER
+ *    Run this ONCE (and again whenever you change the token or the time).
  ****************************************************/
-const AD_CREATIVE_CONFIG = {
+function setSecrets() {
+  const props = PropertiesService.getScriptProperties();
+
+  // ----- Meta credentials -----
+  props.setProperty('META_AD_ACCOUNT_ID', 'act_1229');   // e.g. act_1234567890
+  props.setProperty('META_ACCESS_TOKEN',  'EAASWVrjY');  // Marketing API token
+  props.setProperty('API_VERSION',        'v19.0');       // Graph API version
+
+  // ----- Daily trigger time (24h clock, script timezone) -----
+  // The daily pull runs once a day at this time. Change these and re-run
+  // setSecrets() to move it.
+  props.setProperty('TRIGGER_HOUR',   '15');  // 0–23  (15 = 3 PM)
+  props.setProperty('TRIGGER_MINUTE', '0');   // 0–59
+
+  // (Re)install the daily trigger using the time above.
+  installDailyTrigger();
+
+  Logger.log('✅ Secrets saved and daily trigger installed.');
+}
+
+/****************************************************
+ * CONFIG — columns, sheet, sizing, pacing
+ ****************************************************/
+const CFG = {
   SHEET_NAME: 'Lead Data',
 
-  // Column letters (numeric equivalents computed automatically)
-  //
-  // ---- SOURCE: which ad to look up. We now search Ads Manager by ID. ----
-  // Update these letters to wherever the IDs live in your sheet.
-  COL_CAMPAIGN_ID: 'I',  // Source: Campaign ID (optional — used to scope / verify the match)
-  COL_ADSET_ID:    'J',  // Source: Ad Set ID  (optional — used to scope / verify the match)
-  COL_AD_ID:       'K',  // Source: Ad ID (primary — an Ad ID uniquely identifies the ad)
-  //
-  // IMPORTANT: Format these ID columns as PLAIN TEXT in the sheet. Meta IDs are
-  // 15–17 digits long and will lose precision (and stop matching) if the cell is
-  // formatted as a Number.
-  //
-  // ---- OUTPUT: where results are written (unchanged) ----
-  COL_AD_PREVIEW:     'V',  // Output: ad preview iframe link
-  COL_CREATIVE_LINK:  'W',  // Output: full-quality creative URL (image or video watch link)
-  COL_AD_THUMBNAIL:   'X',  // Output: =IMAGE() formula for HQ thumbnail
+  // ----- SOURCE columns (the IDs used to find the exact ad) -----
+  COL_CAMPAIGN_ID: 'K',
+  COL_ADSET_ID:    'L',
+  COL_AD_ID:       'M',
+  // NOTE: format these ID columns as PLAIN TEXT — Meta IDs are 15–17 digits and
+  // lose precision (and stop matching) if the cell is formatted as a Number.
 
-  // Image sizing (in pixels)
+  // ----- OUTPUT columns -----
+  COL_PREVIEW_LINK:  'N',  // ad preview iframe link
+  COL_CREATIVE_LINK: 'O',  // full-quality creative URL (image or video watch link)
+  COL_THUMBNAIL:     'P',  // =IMAGE() formula for the HQ thumbnail
+
+  // Only fill rows whose outputs are still empty (true = skip already-pulled rows).
+  // Set false to re-pull every row that has all three IDs on each run.
+  ONLY_FILL_EMPTY: true,
+
+  // Image sizing (pixels)
   IMAGE_WIDTH_PX:  100,
   IMAGE_HEIGHT_PX: 100,
   ROW_HEIGHT_PX:   100,
 
-  // Daily trigger schedule (24h clock, script timezone)
-  TRIGGER_HOUR:   15,
-  TRIGGER_MINUTE: 0,
-
-  // Manual test range
+  // Manual test range (used by pullCreativesManual)
   MANUAL_START_ROW: 2,
   MANUAL_END_ROW:   5,
 
-  // ===== PACING & RATE LIMIT CONFIG =====
-  SLEEP_MS_BETWEEN_ROWS:        1500,   // base delay between each row (was 400)
-  JITTER_MS:                    500,    // random extra 0–500ms added each row
-  BATCH_PAUSE_EVERY_N_ROWS:     20,     // every N rows, take a longer pause
-  BATCH_PAUSE_MS:               30000,  // 30s long pause every batch
-  RATE_LIMIT_COOLDOWN_MS:       300000, // 5 min pause when rate-limited
-  MAX_RATE_LIMIT_RETRIES:       3,      // how many times to retry a rate-limited row
-  MAX_EXECUTION_MS:             330000, // 5.5 min — Apps Script kills at 6 min, so bail before that
+  // ----- Pacing & rate-limit handling -----
+  SLEEP_MS_BETWEEN_ROWS:    1500,
+  JITTER_MS:                500,
+  BATCH_PAUSE_EVERY_N_ROWS: 20,
+  BATCH_PAUSE_MS:           30000,
+  RATE_LIMIT_COOLDOWN_MS:   300000,  // 5 min pause when rate-limited
+  MAX_RATE_LIMIT_RETRIES:   3,
+  MAX_EXECUTION_MS:         330000,  // 5.5 min — bail before Apps Script's 6-min cap
 };
 
 /****************************************************
- * MANUAL FUNCTION — Test on a hardcoded row range
+ * 2a) MANUAL RUN — process a fixed row range
  ****************************************************/
-function pullAdCreativeManual() {
-  const startRow = AD_CREATIVE_CONFIG.MANUAL_START_ROW;
-  const endRow   = AD_CREATIVE_CONFIG.MANUAL_END_ROW;
-  Logger.log(`▶️  MANUAL run for rows ${startRow}–${endRow}`);
-  processRows_(startRow, endRow);
+function pullCreativesManual() {
+  Logger.log(`▶️  MANUAL run for rows ${CFG.MANUAL_START_ROW}–${CFG.MANUAL_END_ROW}`);
+  const rows = [];
+  for (let r = CFG.MANUAL_START_ROW; r <= CFG.MANUAL_END_ROW; r++) rows.push(r);
+  processRows_(rows);
 }
 
 /****************************************************
- * AUTOMATED FUNCTION — Runs daily at TRIGGER_HOUR
+ * 2b) DAILY AUTO RUN — installed by setSecrets()/installDailyTrigger()
+ *     Processes every non-empty row that has all three IDs.
  ****************************************************/
-function pullAdCreativeDailyAuto() {
-  const cfg = AD_CREATIVE_CONFIG;
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(cfg.SHEET_NAME);
-  if (!sheet) throw new Error(`Sheet "${cfg.SHEET_NAME}" not found.`);
-
-  const colAdId = colLetterToNum_(cfg.COL_AD_ID);
-  const colV = colLetterToNum_(cfg.COL_AD_PREVIEW);
-  const colW = colLetterToNum_(cfg.COL_CREATIVE_LINK);
-  const colX = colLetterToNum_(cfg.COL_AD_THUMBNAIL);
-
-  const lastDataRow = sheet.getLastRow();
-  if (lastDataRow < 2) {
-    Logger.log('ℹ️  No data rows to process.');
+function pullCreativesDailyAuto() {
+  const sheet = getSheet_();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('ℹ️  No data rows.');
     return;
   }
 
-  // Last non-empty row in the Ad ID column
-  const idValues = sheet.getRange(2, colAdId, lastDataRow - 1, 1).getValues();
-  let lastIdRow = 1;
-  for (let i = idValues.length - 1; i >= 0; i--) {
-    if (String(idValues[i][0] || '').trim() !== '') {
-      lastIdRow = i + 2;
-      break;
+  const cCamp  = colLetterToNum_(CFG.COL_CAMPAIGN_ID);
+  const cAdset = colLetterToNum_(CFG.COL_ADSET_ID);
+  const cAd    = colLetterToNum_(CFG.COL_AD_ID);
+  const cN     = colLetterToNum_(CFG.COL_PREVIEW_LINK);
+  const cO     = colLetterToNum_(CFG.COL_CREATIVE_LINK);
+  const cP     = colLetterToNum_(CFG.COL_THUMBNAIL);
+
+  const numRows = lastRow - 1;
+
+  // Read the three ID columns (display values preserve large IDs as text).
+  const campVals  = sheet.getRange(2, cCamp,  numRows, 1).getDisplayValues();
+  const adsetVals = sheet.getRange(2, cAdset, numRows, 1).getDisplayValues();
+  const adVals    = sheet.getRange(2, cAd,    numRows, 1).getDisplayValues();
+
+  // Read the three output columns in one contiguous block.
+  const minOut = Math.min(cN, cO, cP);
+  const maxOut = Math.max(cN, cO, cP);
+  const outVals = sheet.getRange(2, minOut, numRows, maxOut - minOut + 1).getValues();
+  const nIdx = cN - minOut, oIdx = cO - minOut, pIdx = cP - minOut;
+
+  const rows = [];
+  for (let i = 0; i < numRows; i++) {
+    const hasIds =
+      cleanId_(campVals[i][0])  !== '' &&
+      cleanId_(adsetVals[i][0]) !== '' &&
+      cleanId_(adVals[i][0])    !== '';
+    if (!hasIds) continue;   // only non-empty rows where all three IDs exist
+
+    if (CFG.ONLY_FILL_EMPTY) {
+      const alreadyFilled =
+        String(outVals[i][nIdx] || '').trim() !== '' ||
+        String(outVals[i][oIdx] || '').trim() !== '' ||
+        String(outVals[i][pIdx] || '').trim() !== '';
+      if (alreadyFilled) continue;
     }
+    rows.push(i + 2);
   }
 
-  if (lastIdRow < 2) {
-    Logger.log('ℹ️  No Ad IDs found in source column.');
+  if (rows.length === 0) {
+    Logger.log('✅ Nothing to do — no rows with IDs need pulling.');
     return;
   }
 
-  // Last filled row across V, W, X
-  const minCol = Math.min(colV, colW, colX);
-  const maxCol = Math.max(colV, colW, colX);
-  const outputRange = sheet.getRange(2, minCol, lastIdRow - 1, maxCol - minCol + 1).getValues();
-  const vIdx = colV - minCol;
-  const wIdx = colW - minCol;
-  const xIdx = colX - minCol;
-
-  let lastFilledRow = 1;
-  for (let i = outputRange.length - 1; i >= 0; i--) {
-    const row = outputRange[i];
-    const filled =
-      String(row[vIdx] || '').trim() !== '' ||
-      String(row[wIdx] || '').trim() !== '' ||
-      String(row[xIdx] || '').trim() !== '';
-    if (filled) {
-      lastFilledRow = i + 2;
-      break;
-    }
-  }
-
-  const startRow = lastFilledRow + 1;
-  const endRow = lastIdRow;
-
-  if (startRow > endRow) {
-    Logger.log(`✅ Nothing to do. Last filled row: ${lastFilledRow}, last Ad ID row: ${lastIdRow}.`);
-    return;
-  }
-
-  Logger.log(`▶️  AUTO run for rows ${startRow}–${endRow} (last filled: ${lastFilledRow}, last Ad ID: ${lastIdRow})`);
-  processRows_(startRow, endRow);
+  Logger.log(`▶️  AUTO run for ${rows.length} row(s): ${rows[0]}…${rows[rows.length - 1]}`);
+  processRows_(rows);
 }
 
 /****************************************************
- * SHARED — Loop through a row range with rate-limit handling
+ * SHARED — process a list of row numbers with pacing + rate-limit retries
  ****************************************************/
-function processRows_(startRow, endRow) {
-  const cfg = AD_CREATIVE_CONFIG;
+function processRows_(rows) {
+  const runStart = Date.now();
+  let success = 0, failed = 0, skipped = 0, inBatch = 0;
 
-  if (startRow < 2) {
-    Logger.log(`⚠️  startRow ${startRow} is below 2, bumping to 2 to protect header.`);
-    startRow = 2;
-  }
+  for (let idx = 0; idx < rows.length; idx++) {
+    const row = rows[idx];
 
-  const runStartTime = Date.now();
-  let success = 0, failed = 0, skipped = 0;
-  let processedInBatch = 0;
-
-  for (let row = startRow; row <= endRow; row++) {
-    // Bail if we're approaching the 6-min Apps Script execution cap
-    if (Date.now() - runStartTime > cfg.MAX_EXECUTION_MS) {
-      Logger.log(`⏰ Approaching execution time limit. Stopping at row ${row - 1}. Next trigger run will resume.`);
+    if (Date.now() - runStart > CFG.MAX_EXECUTION_MS) {
+      Logger.log(`⏰ Time limit approaching. Stopping before row ${row}. Next run resumes.`);
       break;
     }
 
-    let attempts = 0;
-    let done = false;
-
-    while (!done && attempts <= cfg.MAX_RATE_LIMIT_RETRIES) {
+    let attempts = 0, done = false;
+    while (!done && attempts <= CFG.MAX_RATE_LIMIT_RETRIES) {
       try {
-        const result = pullAdCreative_(row);
+        const result = pullOne_(row);
         if (result === 'SUCCESS') success++;
         else if (result === 'SKIPPED') skipped++;
         else failed++;
         done = true;
       } catch (err) {
-        const isRateLimit = isRateLimitError_(err.message);
-        if (isRateLimit && attempts < cfg.MAX_RATE_LIMIT_RETRIES) {
+        if (isRateLimitError_(err.message) && attempts < CFG.MAX_RATE_LIMIT_RETRIES) {
           attempts++;
-          Logger.log(`🛑 Rate limited on row ${row}. Cooldown ${cfg.RATE_LIMIT_COOLDOWN_MS / 1000}s (attempt ${attempts}/${cfg.MAX_RATE_LIMIT_RETRIES})…`);
-          Utilities.sleep(cfg.RATE_LIMIT_COOLDOWN_MS);
+          Logger.log(`🛑 Rate limited on row ${row}. Cooldown ${CFG.RATE_LIMIT_COOLDOWN_MS / 1000}s (attempt ${attempts}/${CFG.MAX_RATE_LIMIT_RETRIES})…`);
+          Utilities.sleep(CFG.RATE_LIMIT_COOLDOWN_MS);
         } else {
           Logger.log(`❌ Row ${row} threw: ${err.message}`);
           failed++;
@@ -179,46 +183,23 @@ function processRows_(startRow, endRow) {
       }
     }
 
-    processedInBatch++;
+    inBatch++;
+    Utilities.sleep(CFG.SLEEP_MS_BETWEEN_ROWS + Math.floor(Math.random() * CFG.JITTER_MS));
 
-    // Base delay + random jitter between every row
-    const jitter = Math.floor(Math.random() * cfg.JITTER_MS);
-    Utilities.sleep(cfg.SLEEP_MS_BETWEEN_ROWS + jitter);
-
-    // Longer pause every N rows
-    if (processedInBatch >= cfg.BATCH_PAUSE_EVERY_N_ROWS && row < endRow) {
-      Logger.log(`⏸️  Batch pause: ${cfg.BATCH_PAUSE_MS / 1000}s after ${processedInBatch} rows…`);
-      Utilities.sleep(cfg.BATCH_PAUSE_MS);
-      processedInBatch = 0;
+    if (inBatch >= CFG.BATCH_PAUSE_EVERY_N_ROWS && idx < rows.length - 1) {
+      Logger.log(`⏸️  Batch pause ${CFG.BATCH_PAUSE_MS / 1000}s after ${inBatch} rows…`);
+      Utilities.sleep(CFG.BATCH_PAUSE_MS);
+      inBatch = 0;
     }
   }
 
-  Logger.log(`✅ Done. Rows ${startRow}–${endRow} | Success: ${success} | Failed: ${failed} | Skipped: ${skipped}`);
+  Logger.log(`✅ Done. Success: ${success} | Failed: ${failed} | Skipped: ${skipped}`);
 }
 
 /****************************************************
- * HELPER — Detect Meta rate-limit error messages
+ * CORE — pull preview + creative + thumbnail for ONE row
  ****************************************************/
-function isRateLimitError_(message) {
-  if (!message) return false;
-  const m = message.toLowerCase();
-  return (
-    m.includes('user request limit reached') ||
-    m.includes('too many api calls') ||
-    m.includes('"code":17') ||
-    m.includes('"code":4') ||         // app-level rate limit
-    m.includes('"code":32') ||        // page-level rate limit
-    m.includes('"code":613') ||       // custom limit
-    m.includes('rate limit')
-  );
-}
-
-/****************************************************
- * CORE — Fetch ad preview + creative URL + thumbnail for one row
- ****************************************************/
-function pullAdCreative_(rowNum) {
-  const cfg = AD_CREATIVE_CONFIG;
-
+function pullOne_(rowNum) {
   if (rowNum < 2) {
     Logger.log(`⛔ Refusing to write to row ${rowNum} (header row).`);
     return 'FAILED';
@@ -228,43 +209,41 @@ function pullAdCreative_(rowNum) {
   const ACCOUNT_ID   = props.getProperty('META_AD_ACCOUNT_ID');
   const ACCESS_TOKEN = props.getProperty('META_ACCESS_TOKEN');
   const API_VERSION  = props.getProperty('API_VERSION') || 'v19.0';
+  if (!ACCOUNT_ID || !ACCESS_TOKEN) {
+    throw new Error('Missing META_AD_ACCOUNT_ID / META_ACCESS_TOKEN — run setSecrets() first.');
+  }
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(cfg.SHEET_NAME);
-  if (!sheet) throw new Error(`Sheet "${cfg.SHEET_NAME}" not found.`);
+  const sheet = getSheet_();
+  const cCamp  = colLetterToNum_(CFG.COL_CAMPAIGN_ID);
+  const cAdset = colLetterToNum_(CFG.COL_ADSET_ID);
+  const cAd    = colLetterToNum_(CFG.COL_AD_ID);
+  const cN     = colLetterToNum_(CFG.COL_PREVIEW_LINK);
+  const cO     = colLetterToNum_(CFG.COL_CREATIVE_LINK);
+  const cP     = colLetterToNum_(CFG.COL_THUMBNAIL);
 
-  const colCampaignId = colLetterToNum_(cfg.COL_CAMPAIGN_ID);
-  const colAdsetId    = colLetterToNum_(cfg.COL_ADSET_ID);
-  const colAdId       = colLetterToNum_(cfg.COL_AD_ID);
-  const colV = colLetterToNum_(cfg.COL_AD_PREVIEW);
-  const colW = colLetterToNum_(cfg.COL_CREATIVE_LINK);
-  const colX = colLetterToNum_(cfg.COL_AD_THUMBNAIL);
+  const campaignId = cleanId_(sheet.getRange(rowNum, cCamp).getDisplayValue());
+  const adsetId    = cleanId_(sheet.getRange(rowNum, cAdset).getDisplayValue());
+  const adId       = cleanId_(sheet.getRange(rowNum, cAd).getDisplayValue());
 
-  // Read the IDs. getDisplayValue() preserves the cell text so large IDs are not
-  // mangled into scientific notation when read.
-  const campaignId = cleanId_(sheet.getRange(rowNum, colCampaignId).getDisplayValue());
-  const adsetId    = cleanId_(sheet.getRange(rowNum, colAdsetId).getDisplayValue());
-  const adId       = cleanId_(sheet.getRange(rowNum, colAdId).getDisplayValue());
-
-  if (!adId && !adsetId && !campaignId) {
-    Logger.log(`⏭️  Row ${rowNum}: no Campaign/Ad Set/Ad ID, skipping.`);
+  if (!adId) {
+    Logger.log(`⏭️  Row ${rowNum}: no Ad ID, skipping.`);
     return 'SKIPPED';
   }
 
-  Logger.log(`🔎 Row ${rowNum}: searching by IDs (campaign=${campaignId || '-'}, adset=${adsetId || '-'}, ad=${adId || '-'})`);
+  Logger.log(`🔎 Row ${rowNum}: campaign=${campaignId || '-'}, adset=${adsetId || '-'}, ad=${adId}`);
 
-  const ad = findAdByIds_(API_VERSION, ACCESS_TOKEN, campaignId, adsetId, adId);
-
+  const ad = findExactAd_(API_VERSION, ACCESS_TOKEN, campaignId, adsetId, adId);
   if (!ad) {
-    sheet.getRange(rowNum, colW).setValue('NOT FOUND');
-    Logger.log(`❌ Row ${rowNum}: no ad found for the provided ID(s).`);
+    sheet.getRange(rowNum, cO).setValue('NOT FOUND');
+    Logger.log(`❌ Row ${rowNum}: ad ${adId} not found.`);
     return 'FAILED';
   }
 
   const creative = ad.creative || {};
-  Logger.log(`✅ Row ${rowNum}: ad ID ${ad.id}`);
+  Logger.log(`✅ Row ${rowNum}: found ad ${ad.id}`);
 
-  // ===== AD PREVIEW LINK (Column V) =====
-  let adPreviewLink = '';
+  // ===== PREVIEW LINK (Column N) =====
+  let previewLink = '';
   try {
     const previewUrl = buildUrl_(
       `https://graph.facebook.com/${API_VERSION}/${ad.id}/previews`,
@@ -273,18 +252,18 @@ function pullAdCreative_(rowNum) {
     const previewRes = fetchJson_(previewUrl);
     if (previewRes.data && previewRes.data.length > 0 && previewRes.data[0].body) {
       const match = previewRes.data[0].body.match(/src="([^"]+)"/);
-      if (match) adPreviewLink = match[1].replace(/&amp;/g, '&');
+      if (match) previewLink = match[1].replace(/&amp;/g, '&');
     }
   } catch (e) {
-    if (isRateLimitError_(e.message)) throw e; // let the retry logic handle it
+    if (isRateLimitError_(e.message)) throw e;
     Logger.log(`⚠️  Row ${rowNum}: preview fetch failed: ${e.message}`);
   }
 
-  // ===== CREATIVE LINK + THUMBNAIL =====
+  // ===== CREATIVE LINK (Column O) + THUMBNAIL (Column P) =====
   let creativeUrl = '';
   let thumbnailUrl = '';
 
-  // (a) Video ad — use public watch link + thumbnail from creative (no /videos call)
+  // (a) Video ad
   if (creative.video_id) {
     creativeUrl = `https://www.facebook.com/watch/?v=${creative.video_id}`;
     if (creative.object_story_spec
@@ -294,7 +273,6 @@ function pullAdCreative_(rowNum) {
     } else if (creative.thumbnail_url) {
       thumbnailUrl = creative.thumbnail_url;
     }
-    Logger.log(`🎥 Row ${rowNum}: video watch link + thumbnail set`);
   }
 
   // (b) Image hash → /adimages
@@ -331,10 +309,7 @@ function pullAdCreative_(rowNum) {
   if (!creativeUrl && creative.effective_object_story_id) {
     const postUrl = buildUrl_(
       `https://graph.facebook.com/${API_VERSION}/${creative.effective_object_story_id}`,
-      {
-        fields: 'full_picture,permalink_url,attachments{media,media_type,url}',
-        access_token: ACCESS_TOKEN
-      }
+      { fields: 'full_picture,permalink_url,attachments{media,media_type,url}', access_token: ACCESS_TOKEN }
     );
     const postRes = fetchJson_(postUrl);
     creativeUrl =
@@ -343,120 +318,65 @@ function pullAdCreative_(rowNum) {
       postRes.permalink_url || '';
   }
 
-  // STEP 3 — Write results
-  if (adPreviewLink) {
-    sheet.getRange(rowNum, colV).setValue(adPreviewLink);
-  }
+  // ===== WRITE =====
+  if (previewLink) sheet.getRange(rowNum, cN).setValue(previewLink);
 
   if (creativeUrl) {
-    sheet.getRange(rowNum, colW).setValue(creativeUrl);
+    sheet.getRange(rowNum, cO).setValue(creativeUrl);
     const imageForDisplay = thumbnailUrl || creativeUrl;
-    sheet.getRange(rowNum, colX).setFormula(
-      `=IMAGE("${imageForDisplay}", 4, ${cfg.IMAGE_HEIGHT_PX}, ${cfg.IMAGE_WIDTH_PX})`
+    sheet.getRange(rowNum, cP).setFormula(
+      `=IMAGE("${imageForDisplay}", 4, ${CFG.IMAGE_HEIGHT_PX}, ${CFG.IMAGE_WIDTH_PX})`
     );
-    sheet.setRowHeightsForced(rowNum, 1, cfg.ROW_HEIGHT_PX);
-    Logger.log(`✅ Row ${rowNum}: V=preview, W=creative, X=image`);
+    sheet.setRowHeightsForced(rowNum, 1, CFG.ROW_HEIGHT_PX);
+    Logger.log(`✅ Row ${rowNum}: N=preview, O=creative, P=image`);
     return 'SUCCESS';
-  } else {
-    sheet.getRange(rowNum, colW).setValue('NO CREATIVE FOUND');
-    Logger.log(`⚠️  Row ${rowNum}: ad found but no creative URL resolved.`);
-    return 'FAILED';
   }
+
+  sheet.getRange(rowNum, cO).setValue('NO CREATIVE FOUND');
+  Logger.log(`⚠️  Row ${rowNum}: ad found but no creative URL resolved.`);
+  return 'FAILED';
 }
 
 /****************************************************
- * HELPER — Find an ad by Campaign ID / Ad Set ID / Ad ID
- *
- * Priority:
- *   1. Ad ID      → fetch the ad directly (an Ad ID uniquely identifies the ad).
- *   2. Ad Set ID  → first ad on the ad set's /ads edge.
- *   3. Campaign ID→ first ad on the campaign's /ads edge.
+ * HELPER — find the EXACT ad by Ad ID, verified against Campaign/Ad Set ID
  ****************************************************/
-function findAdByIds_(apiVersion, accessToken, campaignId, adsetId, adId) {
+function findExactAd_(apiVersion, accessToken, campaignId, adsetId, adId) {
   const adFields = 'id,name,campaign_id,adset_id,creative{id,image_hash,image_url,thumbnail_url,object_story_spec,asset_feed_spec,effective_object_story_id,video_id}';
 
-  // (1) Ad ID — most reliable. Fetch the ad node directly.
-  if (adId) {
-    try {
-      const url = buildUrl_(
-        `https://graph.facebook.com/${apiVersion}/${adId}`,
-        { fields: adFields, access_token: accessToken }
-      );
-      const ad = fetchJson_(url);
-      if (ad && ad.id) {
-        // Optional sanity checks against the Campaign / Ad Set IDs, if provided.
-        if (campaignId && String(ad.campaign_id) !== String(campaignId)) {
-          Logger.log(`⚠️  Ad ${adId} campaign_id ${ad.campaign_id} != expected ${campaignId}`);
-        }
-        if (adsetId && String(ad.adset_id) !== String(adsetId)) {
-          Logger.log(`⚠️  Ad ${adId} adset_id ${ad.adset_id} != expected ${adsetId}`);
-        }
-        return ad;
-      }
-    } catch (e) {
-      if (isRateLimitError_(e.message)) throw e;
-      Logger.log(`⚠️  Direct Ad ID fetch failed for ${adId}: ${e.message}`);
-    }
-  }
+  const url = buildUrl_(
+    `https://graph.facebook.com/${apiVersion}/${adId}`,
+    { fields: adFields, access_token: accessToken }
+  );
 
-  // (2) Ad Set ID — list ads under the ad set and take the first.
-  if (adsetId) {
-    const ad = findAdOnEdge_(adsetId, apiVersion, accessToken, adFields);
-    if (ad) return ad;
-  }
-
-  // (3) Campaign ID — list ads under the campaign and take the first.
-  if (campaignId) {
-    const ad = findAdOnEdge_(campaignId, apiVersion, accessToken, adFields);
-    if (ad) return ad;
-  }
-
-  return null;
-}
-
-/****************************************************
- * HELPER — Fetch the first ad on a parent's /ads edge
- *          (parent = an Ad Set ID or a Campaign ID)
- ****************************************************/
-function findAdOnEdge_(parentId, apiVersion, accessToken, adFields) {
+  let ad;
   try {
-    const url = buildUrl_(
-      `https://graph.facebook.com/${apiVersion}/${parentId}/ads`,
-      { fields: adFields, limit: '10', access_token: accessToken }
-    );
-    const res = fetchJson_(url);
-    if (res.data && res.data.length > 0) return res.data[0];
+    ad = fetchJson_(url);
   } catch (e) {
     if (isRateLimitError_(e.message)) throw e;
-    Logger.log(`⚠️  Edge lookup failed for ${parentId}: ${e.message}`);
+    Logger.log(`⚠️  Ad ID ${adId} lookup failed: ${e.message}`);
+    return null;
   }
-  return null;
+
+  if (!ad || !ad.id) return null;
+
+  // Verify this really is the exact ad the row points to.
+  if (campaignId && String(ad.campaign_id) !== String(campaignId)) {
+    Logger.log(`⚠️  Ad ${adId}: campaign_id ${ad.campaign_id} ≠ expected ${campaignId}`);
+  }
+  if (adsetId && String(ad.adset_id) !== String(adsetId)) {
+    Logger.log(`⚠️  Ad ${adId}: adset_id ${ad.adset_id} ≠ expected ${adsetId}`);
+  }
+
+  return ad;
 }
 
 /****************************************************
- * HELPER — Normalize an ID read from the sheet
- ****************************************************/
-function cleanId_(raw) {
-  let s = String(raw == null ? '' : raw)
-    .replace(/ /g, ' ')  // non-breaking spaces
-    .replace(/\s+/g, '')      // strip all whitespace
-    .trim();
-  // Drop a trailing ".0" that can appear if an ID was read as a number.
-  s = s.replace(/\.0+$/, '');
-  return s;
-}
-
-/****************************************************
- * HELPER — Resolve image hash to direct CDN URL
+ * HELPER — resolve an image hash to a direct CDN URL
  ****************************************************/
 function resolveImageHash_(accountId, apiVersion, accessToken, hash) {
   const url = buildUrl_(
     `https://graph.facebook.com/${apiVersion}/${accountId}/adimages`,
-    {
-      hashes: JSON.stringify([hash]),
-      fields: 'hash,url,permalink_url,original_width,original_height',
-      access_token: accessToken
-    }
+    { hashes: JSON.stringify([hash]), fields: 'hash,url,permalink_url,original_width,original_height', access_token: accessToken }
   );
   const res = fetchJson_(url);
   let imgObj = null;
@@ -470,19 +390,53 @@ function resolveImageHash_(accountId, apiVersion, accessToken, hash) {
 }
 
 /****************************************************
- * HELPER — Column letter (A, B, ..., AA) → 1-based number
+ * HELPER — detect Meta rate-limit error messages
+ ****************************************************/
+function isRateLimitError_(message) {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  return (
+    m.includes('user request limit reached') ||
+    m.includes('too many api calls') ||
+    m.includes('"code":17') ||
+    m.includes('"code":4') ||   // app-level
+    m.includes('"code":32') ||  // page-level
+    m.includes('"code":613') || // custom limit
+    m.includes('rate limit')
+  );
+}
+
+/****************************************************
+ * HELPER — normalize an ID read from the sheet
+ ****************************************************/
+function cleanId_(raw) {
+  // \s also matches non-breaking spaces in JS, so this clears every kind of
+  // whitespace (IDs never contain any). Also drop a trailing ".0" that appears
+  // if an ID was accidentally read as a number.
+  return String(raw == null ? '' : raw).replace(/\s+/g, '').replace(/\.0+$/, '').trim();
+}
+
+/****************************************************
+ * HELPER — sheet handle
+ ****************************************************/
+function getSheet_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CFG.SHEET_NAME);
+  if (!sheet) throw new Error(`Sheet "${CFG.SHEET_NAME}" not found.`);
+  return sheet;
+}
+
+/****************************************************
+ * HELPER — column letter (A, B, …, AA) → 1-based number
  ****************************************************/
 function colLetterToNum_(letter) {
   const s = String(letter).toUpperCase();
   let n = 0;
-  for (let i = 0; i < s.length; i++) {
-    n = n * 26 + (s.charCodeAt(i) - 64);
-  }
+  for (let i = 0; i < s.length; i++) n = n * 26 + (s.charCodeAt(i) - 64);
   return n;
 }
 
 /****************************************************
- * HELPER — Build URL with encoded params
+ * HELPER — build a URL with encoded params
  ****************************************************/
 function buildUrl_(base, params) {
   const qs = Object.keys(params)
@@ -492,7 +446,7 @@ function buildUrl_(base, params) {
 }
 
 /****************************************************
- * HELPER — Fetch JSON with error handling
+ * HELPER — fetch JSON with error handling
  ****************************************************/
 function fetchJson_(url) {
   const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
@@ -506,47 +460,39 @@ function fetchJson_(url) {
 }
 
 /****************************************************
- * TRIGGER SETUP — Run once to install the daily trigger
+ * TRIGGER — install the daily trigger from the saved time
+ *    (called automatically by setSecrets)
  ****************************************************/
 function installDailyTrigger() {
-  const cfg = AD_CREATIVE_CONFIG;
+  const props = PropertiesService.getScriptProperties();
+  const hour   = parseInt(props.getProperty('TRIGGER_HOUR')   || '15', 10);
+  const minute = parseInt(props.getProperty('TRIGGER_MINUTE') || '0',  10);
 
+  // Remove any existing trigger for the daily function first.
   ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === 'pullAdCreativeDailyAuto') {
-      ScriptApp.deleteTrigger(t);
-    }
+    if (t.getHandlerFunction() === 'pullCreativesDailyAuto') ScriptApp.deleteTrigger(t);
   });
 
-  ScriptApp.newTrigger('pullAdCreativeDailyAuto')
+  ScriptApp.newTrigger('pullCreativesDailyAuto')
     .timeBased()
     .everyDays(1)
-    .atHour(cfg.TRIGGER_HOUR)
-    .nearMinute(cfg.TRIGGER_MINUTE)
+    .atHour(hour)
+    .nearMinute(minute)
     .create();
 
-  Logger.log(`✅ Daily trigger installed for ${cfg.TRIGGER_HOUR}:${String(cfg.TRIGGER_MINUTE).padStart(2, '0')}`);
+  Logger.log(`✅ Daily trigger installed for ${hour}:${String(minute).padStart(2, '0')}`);
 }
 
 /****************************************************
- * TRIGGER REMOVAL — Run to remove the daily trigger
+ * TRIGGER — remove the daily trigger
  ****************************************************/
 function removeDailyTrigger() {
-  const triggers = ScriptApp.getProjectTriggers();
   let removed = 0;
-  triggers.forEach(t => {
-    if (t.getHandlerFunction() === 'pullAdCreativeDailyAuto') {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'pullCreativesDailyAuto') {
       ScriptApp.deleteTrigger(t);
       removed++;
     }
   });
   Logger.log(`✅ Removed ${removed} trigger(s).`);
 }
-// =============================================================================
-//
-//
-//
-// Testing Creative Pulling
-//
-//
-//
-// =============================================================================
