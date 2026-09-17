@@ -11,7 +11,7 @@ preview link, the creative URL, and an HQ thumbnail.
 | Campaign ID           | `K`    | source (format as **plain text**)       |
 | Ad Set ID             | `L`    | source (format as **plain text**)       |
 | Ad ID                 | `M`    | source (format as **plain text**)       |
-| Preview Link          | `N`    | output — ad preview iframe link         |
+| Preview Link          | `N`    | output — **permanent Ads Manager deep link** |
 | Creative Preview Link | `O`    | output — full-quality creative URL      |
 | Ad Thumbnail          | `P`    | output — `=IMAGE()` formula             |
 
@@ -20,6 +20,27 @@ preview link, the creative URL, and an HQ thumbnail.
 
 The **Ad ID** finds the exact ad; the Campaign ID and Ad Set ID are used to
 verify the match (a mismatch is logged, not fatal).
+
+## Link expiry
+
+Meta's URLs are deliberately temporary — there's no permanent version from Meta:
+
+- **Preview Link (N)** is now a **permanent Ads Manager deep link**
+  (`…/manage/ads?act=<acct>&selected_ad_ids=<adId>`). It opens the exact ad,
+  needs no API call, and never expires.
+- **Creative / Thumbnail (O, P)** use Meta's signed `scontent.*.fbcdn.net`
+  image URLs, which expire after a few days. Video links
+  (`facebook.com/watch`) are already permanent. To keep the image links working
+  **without re-hosting**, the daily trigger runs with `CFG.ONLY_FILL_EMPTY =
+  false`, so it **refreshes every eligible row each day** — the stored URL is
+  never more than ~1 day old, well inside Meta's signature lifetime. Identical
+  ads across multiple rows are resolved once per run (per-Ad-ID cache).
+- Want images that are permanent without a daily refresh? That requires
+  re-hosting the image bytes somewhere public (e.g. Google Drive shared
+  "anyone with the link"). That path is intentionally **not** used here.
+
+> To refresh rows that currently hold expired links, just let the daily trigger
+> run (it overwrites them), or run `pullCreativesDailyAuto()` manually once.
 
 ## Setup — run once
 
@@ -38,9 +59,10 @@ re-installs the trigger with the new time.
 
 - **`setSecrets()`** — save credentials + trigger time, then install the trigger.
 - **`pullCreativesDailyAuto()`** — the daily job. Processes every non-empty row
-  where Campaign ID, Ad Set ID, and Ad ID all exist. By default it fills only
-  rows whose N/O/P are still empty (`CFG.ONLY_FILL_EMPTY = true`; set to `false`
-  to re-pull every eligible row daily).
+  where Campaign ID, Ad Set ID, and Ad ID all exist. Default `CFG.ONLY_FILL_EMPTY
+  = false` re-pulls every eligible row so image links stay fresh; set it to
+  `true` to fill only rows whose N/O/P are still empty (image links will then
+  eventually expire).
 - **`pullCreativesManual()`** — process the test range `MANUAL_START_ROW`–`MANUAL_END_ROW`.
 - **`installDailyTrigger()` / `removeDailyTrigger()`** — manage the trigger manually.
 

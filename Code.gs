@@ -4,9 +4,19 @@
 //
 //   Reads Campaign ID (K), Ad Set ID (L), Ad ID (M) from the "Lead Data" sheet,
 //   finds the exact ad in the ad account, and writes back:
-//       Preview Link          → Column N
-//       Creative Preview Link → Column O
-//       Ad Thumbnail          → Column P
+//       Preview Link          → Column N   (PERMANENT Ads Manager deep link)
+//       Creative Preview Link → Column O   (image URL / video watch link)
+//       Ad Thumbnail          → Column P   (=IMAGE() formula)
+//
+//   ── About link expiry ─────────────────────────────────────────────────────
+//   • Column N is now a permanent Ads Manager link — it never expires and needs
+//     no API call.
+//   • Column O/P use Meta's own image URLs (scontent.*.fbcdn.net). Those are
+//     SIGNED and expire after a few days — there is no permanent version from
+//     Meta. To keep them working WITHOUT re-hosting, the daily trigger REFRESHES
+//     every eligible row (CFG.ONLY_FILL_EMPTY = false), so the stored URL is
+//     never more than ~1 day old, well inside Meta's signature lifetime.
+//     Video links (facebook.com/watch) are already permanent.
 //
 //   Secrets (Ad Account ID, Access Token) and the daily trigger time are set
 //   once via setSecrets().
@@ -51,13 +61,15 @@ const CFG = {
   // lose precision (and stop matching) if the cell is formatted as a Number.
 
   // ----- OUTPUT columns -----
-  COL_PREVIEW_LINK:  'N',  // ad preview iframe link
+  COL_PREVIEW_LINK:  'N',  // PERMANENT Ads Manager deep link (opens the ad)
   COL_CREATIVE_LINK: 'O',  // full-quality creative URL (image or video watch link)
   COL_THUMBNAIL:     'P',  // =IMAGE() formula for the HQ thumbnail
 
-  // Only fill rows whose outputs are still empty (true = skip already-pulled rows).
-  // Set false to re-pull every row that has all three IDs on each run.
-  ONLY_FILL_EMPTY: true,
+  // false = REFRESH every eligible row on each run so the image links stay fresh
+  //         (recommended — Meta's image URLs expire after a few days).
+  // true  = only fill rows whose outputs are still empty (image links will
+  //         eventually show "URL signature expired").
+  ONLY_FILL_EMPTY: false,
 
   // Image sizing (pixels)
   IMAGE_WIDTH_PX:  100,
@@ -77,6 +89,10 @@ const CFG = {
   MAX_RATE_LIMIT_RETRIES:   3,
   MAX_EXECUTION_MS:         330000,  // 5.5 min — bail before Apps Script's 6-min cap
 };
+
+// Per-run cache: many rows share the same Ad ID (rows pointing at one ad), so we
+// resolve each ad's creative only once per run. Reset at the start of every run.
+var _RUN_CACHE = {};
 
 /****************************************************
  * 2a) MANUAL RUN — process a fixed row range
@@ -151,6 +167,7 @@ function pullCreativesDailyAuto() {
  * SHARED — process a list of row numbers with pacing + rate-limit retries
  ****************************************************/
 function processRows_(rows) {
+  _RUN_CACHE = {};  // fresh cache for this run
   const runStart = Date.now();
   let success = 0, failed = 0, skipped = 0, inBatch = 0;
 
@@ -197,7 +214,7 @@ function processRows_(rows) {
 }
 
 /****************************************************
- * CORE — pull preview + creative + thumbnail for ONE row
+ * CORE — pull ad link + creative + thumbnail for ONE row
  ****************************************************/
 function pullOne_(rowNum) {
   if (rowNum < 2) {
@@ -232,109 +249,118 @@ function pullOne_(rowNum) {
 
   Logger.log(`🔎 Row ${rowNum}: campaign=${campaignId || '-'}, adset=${adsetId || '-'}, ad=${adId}`);
 
-  const ad = findExactAd_(API_VERSION, ACCESS_TOKEN, campaignId, adsetId, adId);
-  if (!ad) {
+  // ===== PREVIEW / AD LINK (Column N) — permanent, no API call, never expires =====
+  sheet.getRange(rowNum, cN).setValue(adsManagerLink_(ACCOUNT_ID, adId));
+
+  // ===== CREATIVE LINK (Column O) + THUMBNAIL (Column P) =====
+  const c = resolveCreativeForAd_(ACCOUNT_ID, API_VERSION, ACCESS_TOKEN, campaignId, adsetId, adId);
+
+  if (!c.found) {
     sheet.getRange(rowNum, cO).setValue('NOT FOUND');
     Logger.log(`❌ Row ${rowNum}: ad ${adId} not found.`);
     return 'FAILED';
   }
 
-  const creative = ad.creative || {};
-  Logger.log(`✅ Row ${rowNum}: found ad ${ad.id}`);
-
-  // ===== PREVIEW LINK (Column N) =====
-  let previewLink = '';
-  try {
-    const previewUrl = buildUrl_(
-      `https://graph.facebook.com/${API_VERSION}/${ad.id}/previews`,
-      { ad_format: 'DESKTOP_FEED_STANDARD', access_token: ACCESS_TOKEN }
-    );
-    const previewRes = fetchJson_(previewUrl);
-    if (previewRes.data && previewRes.data.length > 0 && previewRes.data[0].body) {
-      const match = previewRes.data[0].body.match(/src="([^"]+)"/);
-      if (match) previewLink = match[1].replace(/&amp;/g, '&');
-    }
-  } catch (e) {
-    if (isRateLimitError_(e.message)) throw e;
-    Logger.log(`⚠️  Row ${rowNum}: preview fetch failed: ${e.message}`);
-  }
-
-  // ===== CREATIVE LINK (Column O) + THUMBNAIL (Column P) =====
-  let creativeUrl = '';
-  let thumbnailUrl = '';
-
-  // (a) Video ad
-  if (creative.video_id) {
-    creativeUrl = `https://www.facebook.com/watch/?v=${creative.video_id}`;
-    if (creative.object_story_spec
-        && creative.object_story_spec.video_data
-        && creative.object_story_spec.video_data.image_url) {
-      thumbnailUrl = creative.object_story_spec.video_data.image_url;
-    } else if (creative.thumbnail_url) {
-      thumbnailUrl = creative.thumbnail_url;
-    }
-  }
-
-  // (b) Image hash → /adimages
-  if (!creativeUrl && creative.image_hash) {
-    creativeUrl = resolveImageHash_(ACCOUNT_ID, API_VERSION, ACCESS_TOKEN, creative.image_hash);
-  }
-
-  // (c) Direct image_url
-  if (!creativeUrl && creative.image_url) {
-    creativeUrl = creative.image_url;
-  }
-
-  // (d) object_story_spec
-  if (!creativeUrl && creative.object_story_spec) {
-    const oss = creative.object_story_spec;
-    if (oss.link_data && oss.link_data.picture) {
-      creativeUrl = oss.link_data.picture;
-    } else if (oss.photo_data && oss.photo_data.url) {
-      creativeUrl = oss.photo_data.url;
-    } else if (oss.video_data && oss.video_data.image_url) {
-      creativeUrl = oss.video_data.image_url;
-    }
-  }
-
-  // (e) asset_feed_spec (DCO)
-  if (!creativeUrl && creative.asset_feed_spec) {
-    const afs = creative.asset_feed_spec;
-    if (afs.images && afs.images.length > 0 && afs.images[0].hash) {
-      creativeUrl = resolveImageHash_(ACCOUNT_ID, API_VERSION, ACCESS_TOKEN, afs.images[0].hash);
-    }
-  }
-
-  // (f) Page post fallback
-  if (!creativeUrl && creative.effective_object_story_id) {
-    const postUrl = buildUrl_(
-      `https://graph.facebook.com/${API_VERSION}/${creative.effective_object_story_id}`,
-      { fields: 'full_picture,permalink_url,attachments{media,media_type,url}', access_token: ACCESS_TOKEN }
-    );
-    const postRes = fetchJson_(postUrl);
-    creativeUrl =
-      postRes.full_picture ||
-      (postRes.attachments && postRes.attachments.data && postRes.attachments.data[0]?.media?.image?.src) ||
-      postRes.permalink_url || '';
-  }
-
-  // ===== WRITE =====
-  if (previewLink) sheet.getRange(rowNum, cN).setValue(previewLink);
-
-  if (creativeUrl) {
-    sheet.getRange(rowNum, cO).setValue(creativeUrl);
-    const imageForDisplay = thumbnailUrl || creativeUrl;
+  if (c.creativeUrl) {
+    sheet.getRange(rowNum, cO).setValue(c.creativeUrl);
+    const imageForDisplay = c.thumbnailUrl || c.creativeUrl;
     sheet.getRange(rowNum, cP).setFormula(
       `=IMAGE("${imageForDisplay}", 4, ${CFG.IMAGE_HEIGHT_PX}, ${CFG.IMAGE_WIDTH_PX})`
     );
     sheet.setRowHeightsForced(rowNum, 1, CFG.ROW_HEIGHT_PX);
-    Logger.log(`✅ Row ${rowNum}: N=preview, O=creative, P=image`);
+    Logger.log(`✅ Row ${rowNum}: N=ad link, O=creative, P=image`);
     return 'SUCCESS';
   }
 
   sheet.getRange(rowNum, cO).setValue('NO CREATIVE FOUND');
   Logger.log(`⚠️  Row ${rowNum}: ad found but no creative URL resolved.`);
   return 'FAILED';
+}
+
+/****************************************************
+ * HELPER — permanent Ads Manager deep link for an ad
+ *          Opens the exact ad in Ads Manager; never expires.
+ ****************************************************/
+function adsManagerLink_(accountId, adId) {
+  const numeric = String(accountId).replace(/^act_/i, '');  // act_123 → 123
+  return `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${numeric}&selected_ad_ids=${adId}`;
+}
+
+/****************************************************
+ * HELPER — resolve an ad's creative URL + thumbnail (cached per Ad ID)
+ ****************************************************/
+function resolveCreativeForAd_(accountId, apiVersion, accessToken, campaignId, adsetId, adId) {
+  if (_RUN_CACHE[adId]) return _RUN_CACHE[adId];
+
+  const out = { found: false, adRealId: adId, creativeUrl: '', thumbnailUrl: '' };
+
+  const ad = findExactAd_(apiVersion, accessToken, campaignId, adsetId, adId);
+  if (!ad) {
+    _RUN_CACHE[adId] = out;
+    return out;
+  }
+
+  out.found = true;
+  out.adRealId = ad.id;
+  const creative = ad.creative || {};
+
+  // (a) Video ad — permanent public watch link + thumbnail from the creative
+  if (creative.video_id) {
+    out.creativeUrl = `https://www.facebook.com/watch/?v=${creative.video_id}`;
+    if (creative.object_story_spec
+        && creative.object_story_spec.video_data
+        && creative.object_story_spec.video_data.image_url) {
+      out.thumbnailUrl = creative.object_story_spec.video_data.image_url;
+    } else if (creative.thumbnail_url) {
+      out.thumbnailUrl = creative.thumbnail_url;
+    }
+  }
+
+  // (b) Image hash → /adimages
+  if (!out.creativeUrl && creative.image_hash) {
+    out.creativeUrl = resolveImageHash_(accountId, apiVersion, accessToken, creative.image_hash);
+  }
+
+  // (c) Direct image_url
+  if (!out.creativeUrl && creative.image_url) {
+    out.creativeUrl = creative.image_url;
+  }
+
+  // (d) object_story_spec
+  if (!out.creativeUrl && creative.object_story_spec) {
+    const oss = creative.object_story_spec;
+    if (oss.link_data && oss.link_data.picture) {
+      out.creativeUrl = oss.link_data.picture;
+    } else if (oss.photo_data && oss.photo_data.url) {
+      out.creativeUrl = oss.photo_data.url;
+    } else if (oss.video_data && oss.video_data.image_url) {
+      out.creativeUrl = oss.video_data.image_url;
+    }
+  }
+
+  // (e) asset_feed_spec (DCO)
+  if (!out.creativeUrl && creative.asset_feed_spec) {
+    const afs = creative.asset_feed_spec;
+    if (afs.images && afs.images.length > 0 && afs.images[0].hash) {
+      out.creativeUrl = resolveImageHash_(accountId, apiVersion, accessToken, afs.images[0].hash);
+    }
+  }
+
+  // (f) Page post fallback
+  if (!out.creativeUrl && creative.effective_object_story_id) {
+    const postUrl = buildUrl_(
+      `https://graph.facebook.com/${apiVersion}/${creative.effective_object_story_id}`,
+      { fields: 'full_picture,permalink_url,attachments{media,media_type,url}', access_token: accessToken }
+    );
+    const postRes = fetchJson_(postUrl);
+    out.creativeUrl =
+      postRes.full_picture ||
+      (postRes.attachments && postRes.attachments.data && postRes.attachments.data[0]?.media?.image?.src) ||
+      postRes.permalink_url || '';
+  }
+
+  _RUN_CACHE[adId] = out;
+  return out;
 }
 
 /****************************************************
